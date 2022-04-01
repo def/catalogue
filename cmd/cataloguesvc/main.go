@@ -3,112 +3,52 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/gorilla/mux"
+	"net"
 	"os"
 	"os/signal"
-	"strings"
+	"strconv"
 	"syscall"
+	"time"
 
-	"github.com/go-kit/kit/log"
 	stdopentracing "github.com/opentracing/opentracing-go"
-	zipkin "github.com/openzipkin/zipkin-go-opentracing"
-
-	"net"
 	"net/http"
 
-	"path/filepath"
-
-	_ "github.com/go-sql-driver/mysql"
+	"github.com/def/catalogue"
 	"github.com/jmoiron/sqlx"
-	"github.com/microservices-demo/catalogue"
+	_ "github.com/lib/pq"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/middleware"
 	"golang.org/x/net/context"
+	"k8s.io/klog"
+	"path/filepath"
 )
-
-const (
-	ServiceName = "catalogue"
-)
-
-var (
-	HTTPLatency = prometheus.NewHistogramVec(prometheus.HistogramOpts{
-		Name:    "http_request_duration_seconds",
-		Help:    "Time (in seconds) spent serving HTTP requests.",
-		Buckets: prometheus.DefBuckets,
-	}, []string{"method", "path", "status_code", "isWS"})
-)
-
-func init() {
-	prometheus.MustRegister(HTTPLatency)
-}
 
 func main() {
 	var (
 		port   = flag.String("port", "80", "Port to bind HTTP listener") // TODO(pb): should be -addr, default ":80"
 		images = flag.String("images", "./images/", "Image path")
-		dsn    = flag.String("DSN", "catalogue_user:default_password@tcp(catalogue-db:3306)/socksdb", "Data Source Name: [username[:password]@][protocol[(address)]]/dbname")
-		zip    = flag.String("zipkin", os.Getenv("ZIPKIN"), "Zipkin address")
+		dsn    = flag.String("DSN", "host=catalogue-db port=5432 user=postgres password=fake_password dbname=socksdb sslmode=disable", "")
 	)
 	flag.Parse()
 
-	fmt.Fprintf(os.Stderr, "images: %q\n", *images)
+	klog.Infof("images: %q\n", *images)
 	abs, err := filepath.Abs(*images)
-	fmt.Fprintf(os.Stderr, "Abs(images): %q (%v)\n", abs, err)
+	klog.Infof("Abs(images): %q (%v)\n", abs, err)
 	pwd, err := os.Getwd()
-	fmt.Fprintf(os.Stderr, "Getwd: %q (%v)\n", pwd, err)
+	klog.Infof("Getwd: %q (%v)\n", pwd, err)
 	files, _ := filepath.Glob(*images + "/*")
-	fmt.Fprintf(os.Stderr, "ls: %q\n", files) // contains a list of all files in the current directory
+	klog.Infof("ls: %q\n", files) // contains a list of all files in the current directory
 
 	// Mechanical stuff.
 	errc := make(chan error)
 	ctx := context.Background()
 
-	// Log domain.
-	var logger log.Logger
-	{
-		logger = log.NewLogfmtLogger(os.Stderr)
-		logger = log.NewContext(logger).With("ts", log.DefaultTimestampUTC)
-		logger = log.NewContext(logger).With("caller", log.DefaultCaller)
-	}
-
-	var tracer stdopentracing.Tracer
-	{
-		if *zip == "" {
-			tracer = stdopentracing.NoopTracer{}
-		} else {
-			// Find service local IP.
-			conn, err := net.Dial("udp", "8.8.8.8:80")
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-			localAddr := conn.LocalAddr().(*net.UDPAddr)
-			host := strings.Split(localAddr.String(), ":")[0]
-			defer conn.Close()
-			logger := log.NewContext(logger).With("tracer", "Zipkin")
-			logger.Log("addr", zip)
-			collector, err := zipkin.NewHTTPCollector(
-				*zip,
-				zipkin.HTTPLogger(logger),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-			tracer, err = zipkin.NewTracer(
-				zipkin.NewRecorder(collector, false, fmt.Sprintf("%v:%v", host, port), ServiceName),
-			)
-			if err != nil {
-				logger.Log("err", err)
-				os.Exit(1)
-			}
-		}
-		stdopentracing.InitGlobalTracer(tracer)
-	}
+	tracer := stdopentracing.NoopTracer{}
 
 	// Data domain.
-	db, err := sqlx.Open("mysql", *dsn)
+	db, err := sqlx.Open("postgres", *dsn)
 	if err != nil {
-		logger.Log("err", err)
+		klog.Exitln(err)
 		os.Exit(1)
 	}
 	defer db.Close()
@@ -116,35 +56,27 @@ func main() {
 	// Check if DB connection can be made, only for logging purposes, should not fail/exit
 	err = db.Ping()
 	if err != nil {
-		logger.Log("Error", "Unable to connect to Database", "DSN", dsn)
+		klog.Errorln(err)
 	}
 
 	// Service domain.
 	var service catalogue.Service
 	{
-		service = catalogue.NewCatalogueService(db, logger)
-		service = catalogue.LoggingMiddleware(logger)(service)
+		service = catalogue.NewCatalogueService(db)
+		service = catalogue.LoggingMiddleware()(service)
 	}
 
 	// Endpoint domain.
 	endpoints := catalogue.MakeEndpoints(service, tracer)
 
 	// HTTP router
-	router := catalogue.MakeHTTPHandler(ctx, endpoints, *images, logger, tracer)
+	router := catalogue.MakeHTTPHandler(ctx, endpoints, *images)
 
-	httpMiddleware := []middleware.Interface{
-		middleware.Instrument{
-			Duration:     HTTPLatency,
-			RouteMatcher: router,
-		},
-	}
-
-	// Handler
-	handler := middleware.Merge(httpMiddleware...).Wrap(router)
+	handler := newRequestMiddleware(router)
 
 	// Create and launch the HTTP server.
 	go func() {
-		logger.Log("transport", "HTTP", "port", *port)
+		klog.Infoln("transport", "HTTP", "port", *port)
 		errc <- http.ListenAndServe(":"+*port, handler)
 	}()
 
@@ -155,5 +87,79 @@ func main() {
 		errc <- fmt.Errorf("%s", <-c)
 	}()
 
-	logger.Log("exit", <-errc)
+	klog.Infoln("exit", <-errc)
+}
+
+type requestMiddleware struct {
+	router    *mux.Router
+	histogram *prometheus.HistogramVec
+}
+
+func newRequestMiddleware(r *mux.Router) http.Handler {
+	m := &requestMiddleware{
+		router: r,
+		histogram: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name:    "http_request_duration_seconds",
+			Help:    "Time (in seconds) spent serving HTTP requests.",
+			Buckets: prometheus.DefBuckets,
+		}, []string{"method", "path", "status_code"}),
+	}
+	prometheus.MustRegister(m.histogram)
+	return m
+}
+
+func (m *requestMiddleware) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.RequestURI == "/healthz" {
+		m.router.ServeHTTP(w, r)
+		return
+	}
+
+	t := time.Now()
+	rw := &responseWriter{w: w, status: http.StatusOK}
+
+	m.router.ServeHTTP(rw, r)
+
+	latency := time.Since(t)
+
+	handler := ""
+	var match mux.RouteMatch
+	routeExists := m.router.Match(r, &match)
+	if routeExists {
+		handler, _ = match.Route.GetPathTemplate()
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	m.histogram.WithLabelValues(r.Method, handler, strconv.Itoa(rw.status)).Observe(latency.Seconds())
+
+	f := klog.Infof
+	switch {
+	case rw.status >= http.StatusInternalServerError:
+		f = klog.Errorf
+	case rw.status >= http.StatusBadRequest:
+		f = klog.Warningf
+	}
+	f(`%s %s %s %s %d %d %dms`, host, r.Method, r.RequestURI, r.Proto, rw.status, rw.size, latency.Milliseconds())
+}
+
+type responseWriter struct {
+	w      http.ResponseWriter
+	status int
+	size   int
+}
+
+func (w *responseWriter) Header() http.Header {
+	return w.w.Header()
+}
+
+func (w *responseWriter) Write(b []byte) (int, error) {
+	n, err := w.w.Write(b)
+	w.size += n
+	return n, err
+}
+
+func (w *responseWriter) WriteHeader(statusCode int) {
+	w.w.WriteHeader(statusCode)
+	w.status = statusCode
 }

@@ -5,11 +5,10 @@ package catalogue
 
 import (
 	"errors"
+	"github.com/jmoiron/sqlx"
+	"k8s.io/klog"
 	"strings"
 	"time"
-
-	"github.com/go-kit/kit/log"
-	"github.com/jmoiron/sqlx"
 )
 
 // Service is the catalogue service, providing read operations on a saleable
@@ -52,20 +51,31 @@ var ErrNotFound = errors.New("not found")
 // ErrDBConnection is returned when connection with the database fails.
 var ErrDBConnection = errors.New("database connection error")
 
-var baseQuery = "SELECT sock.sock_id AS id, sock.name, sock.description, sock.price, sock.count, sock.image_url_1, sock.image_url_2, GROUP_CONCAT(tag.name) AS tag_name FROM sock JOIN sock_tag ON sock.sock_id=sock_tag.sock_id JOIN tag ON sock_tag.tag_id=tag.tag_id"
+var baseQuery = `
+	SELECT 
+		sock.sock_id AS id, 
+		sock.name, 
+		sock.description, 
+		sock.price, 
+		sock.count, 
+		sock.image_url_1, 
+		sock.image_url_2, 
+		string_agg(tag.name, ',') AS tag_name 
+	FROM sock 
+	JOIN sock_tag ON sock.sock_id=sock_tag.sock_id 
+	JOIN tag ON sock_tag.tag_id=tag.tag_id
+`
 
 // NewCatalogueService returns an implementation of the Service interface,
 // with connection to an SQL database.
-func NewCatalogueService(db *sqlx.DB, logger log.Logger) Service {
+func NewCatalogueService(db *sqlx.DB) Service {
 	return &catalogueService{
-		db:     db,
-		logger: logger,
+		db: db,
 	}
 }
 
 type catalogueService struct {
-	db     *sqlx.DB
-	logger log.Logger
+	db *sqlx.DB
 }
 
 func (s *catalogueService) List(tags []string, order string, pageNum, pageSize int) ([]Sock, error) {
@@ -74,28 +84,19 @@ func (s *catalogueService) List(tags []string, order string, pageNum, pageSize i
 
 	var args []interface{}
 
-	for i, t := range tags {
-		if i == 0 {
-			query += " WHERE tag.name=?"
-			args = append(args, t)
-		} else {
-			query += " OR tag.name=?"
-			args = append(args, t)
-		}
+	if len(tags) > 0 {
+		query += " WHERE tag.name IN ($1)"
+		args = append(args, tags)
 	}
-
 	query += " GROUP BY id"
 
 	if order != "" {
-		query += " ORDER BY ?"
-		args = append(args, order)
+		query += " ORDER BY " + order
 	}
-
-	query += ";"
 
 	err := s.db.Select(&socks, query, args...)
 	if err != nil {
-		s.logger.Log("database error", err)
+		klog.Errorln("database error:", err)
 		return []Sock{}, ErrDBConnection
 	}
 	for i, s := range socks {
@@ -112,26 +113,24 @@ func (s *catalogueService) List(tags []string, order string, pageNum, pageSize i
 }
 
 func (s *catalogueService) Count(tags []string) (int, error) {
-	query := "SELECT COUNT(DISTINCT sock.sock_id) FROM sock JOIN sock_tag ON sock.sock_id=sock_tag.sock_id JOIN tag ON sock_tag.tag_id=tag.tag_id"
+	query := `
+		SELECT 
+		    COUNT(DISTINCT sock.sock_id) 
+		FROM sock 
+		JOIN sock_tag ON sock.sock_id=sock_tag.sock_id 
+		JOIN tag ON sock_tag.tag_id=tag.tag_id`
 
 	var args []interface{}
 
-	for i, t := range tags {
-		if i == 0 {
-			query += " WHERE tag.name=?"
-			args = append(args, t)
-		} else {
-			query += " OR tag.name=?"
-			args = append(args, t)
-		}
+	if len(tags) > 0 {
+		query += " WHERE tag.name IN ($1)"
+		args = append(args, tags)
 	}
-
-	query += ";"
 
 	sel, err := s.db.Prepare(query)
 
 	if err != nil {
-		s.logger.Log("database error", err)
+		klog.Errorln("database error:", err)
 		return 0, ErrDBConnection
 	}
 	defer sel.Close()
@@ -140,7 +139,7 @@ func (s *catalogueService) Count(tags []string) (int, error) {
 	err = sel.QueryRow(args...).Scan(&count)
 
 	if err != nil {
-		s.logger.Log("database error", err)
+		klog.Errorln("database error:", err)
 		return 0, ErrDBConnection
 	}
 
@@ -148,12 +147,12 @@ func (s *catalogueService) Count(tags []string) (int, error) {
 }
 
 func (s *catalogueService) Get(id string) (Sock, error) {
-	query := baseQuery + " WHERE sock.sock_id =? GROUP BY sock.sock_id;"
+	query := baseQuery + " WHERE sock.sock_id = $1 GROUP BY sock.sock_id"
 
 	var sock Sock
 	err := s.db.Get(&sock, query, id)
 	if err != nil {
-		s.logger.Log("database error", err)
+		klog.Errorln("database error:", err)
 		return Sock{}, ErrNotFound
 	}
 
@@ -183,17 +182,17 @@ func (s *catalogueService) Health() []Health {
 
 func (s *catalogueService) Tags() ([]string, error) {
 	var tags []string
-	query := "SELECT name FROM tag;"
+	query := "SELECT name FROM tag"
 	rows, err := s.db.Query(query)
 	if err != nil {
-		s.logger.Log("database error", err)
+		klog.Errorln("database error:", err)
 		return []string{}, ErrDBConnection
 	}
 	var tag string
 	for rows.Next() {
 		err = rows.Scan(&tag)
 		if err != nil {
-			s.logger.Log("database error", err)
+			klog.Errorln("database error:", err)
 			continue
 		}
 		tags = append(tags, tag)

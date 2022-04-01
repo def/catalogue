@@ -1,30 +1,27 @@
 package catalogue
 
 import (
+	"k8s.io/klog"
 	"strings"
 	"time"
-
-	"github.com/go-kit/kit/log"
 )
 
 // LoggingMiddleware logs method calls, parameters, results, and elapsed time.
-func LoggingMiddleware(logger log.Logger) Middleware {
+func LoggingMiddleware() Middleware {
 	return func(next Service) Service {
 		return loggingMiddleware{
-			next:   next,
-			logger: logger,
+			next: next,
 		}
 	}
 }
 
 type loggingMiddleware struct {
-	next   Service
-	logger log.Logger
+	next Service
 }
 
 func (mw loggingMiddleware) List(tags []string, order string, pageNum, pageSize int) (socks []Sock, err error) {
 	defer func(begin time.Time) {
-		mw.logger.Log(
+		klog.Infoln(
 			"method", "List",
 			"tags", strings.Join(tags, ", "),
 			"order", order,
@@ -40,7 +37,7 @@ func (mw loggingMiddleware) List(tags []string, order string, pageNum, pageSize 
 
 func (mw loggingMiddleware) Count(tags []string) (n int, err error) {
 	defer func(begin time.Time) {
-		mw.logger.Log(
+		klog.Infoln(
 			"method", "Count",
 			"tags", strings.Join(tags, ", "),
 			"result", n,
@@ -53,7 +50,7 @@ func (mw loggingMiddleware) Count(tags []string) (n int, err error) {
 
 func (mw loggingMiddleware) Get(id string) (s Sock, err error) {
 	defer func(begin time.Time) {
-		mw.logger.Log(
+		klog.Infoln(
 			"method", "Get",
 			"id", id,
 			"sock", s.ID,
@@ -66,7 +63,7 @@ func (mw loggingMiddleware) Get(id string) (s Sock, err error) {
 
 func (mw loggingMiddleware) Tags() (tags []string, err error) {
 	defer func(begin time.Time) {
-		mw.logger.Log(
+		klog.Infoln(
 			"method", "Tags",
 			"result", len(tags),
 			"err", err,
@@ -78,7 +75,7 @@ func (mw loggingMiddleware) Tags() (tags []string, err error) {
 
 func (mw loggingMiddleware) Health() (health []Health) {
 	defer func(begin time.Time) {
-		mw.logger.Log(
+		klog.Infoln(
 			"method", "Health",
 			"result", len(health),
 			"took", time.Since(begin),
